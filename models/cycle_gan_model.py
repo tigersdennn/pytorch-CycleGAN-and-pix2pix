@@ -18,6 +18,7 @@ class CycleGANModel(BaseModel):
             parser.add_argument('--lambda_B', type=float, default=10.0,
                                 help='weight for cycle loss (B -> A -> B)')
             parser.add_argument('--lambda_identity', type=float, default=0.5, help='use identity mapping. Setting lambda_identity other than 0 has an effect of scaling the weight of the identity mapping loss. For example, if the weight of the identity loss should be 10 times smaller than the weight of the reconstruction loss, please set lambda_identity = 0.1')
+            parser.add_argument('--lambda_video', type=float, help='weight for video loss')
 
         return parser
 
@@ -25,7 +26,7 @@ class CycleGANModel(BaseModel):
         BaseModel.initialize(self, opt)
 
         # specify the training losses you want to print out. The program will call base_model.get_current_losses
-        self.loss_names = ['D_A', 'G_A', 'cycle_A', 'idt_A', 'D_B', 'G_B', 'cycle_B', 'idt_B']
+        self.loss_names = ['D_A', 'G_A', 'cycle_A', 'idt_A', 'video_A', 'D_B', 'G_B', 'cycle_B', 'idt_B', 'video_B']
         # specify the images you want to save/display. The program will call base_model.get_current_visuals
         visual_names_A = ['real_A', 'fake_B', 'rec_A']
         visual_names_B = ['real_B', 'fake_A', 'rec_B']
@@ -62,6 +63,7 @@ class CycleGANModel(BaseModel):
             self.criterionGAN = networks.GANLoss(use_lsgan=not opt.no_lsgan).to(self.device)
             self.criterionCycle = torch.nn.L1Loss()
             self.criterionIdt = torch.nn.L1Loss()
+            self.criterionVideo = torch.nn.L1Loss()
             # initialize optimizers
             self.optimizer_G = torch.optim.Adam(itertools.chain(self.netG_A.parameters(), self.netG_B.parameters()),
                                                 lr=opt.lr, betas=(opt.beta1, 0.999))
@@ -75,6 +77,20 @@ class CycleGANModel(BaseModel):
         AtoB = self.opt.direction == 'AtoB'
         self.real_A = input['A' if AtoB else 'B'].to(self.device)
         self.real_B = input['B' if AtoB else 'A'].to(self.device)
+
+        if self.isTrain:
+            move_eps = self.opt.video_eps
+
+            self.real_A_left = torch.cat((self.real_A[:, :, :, move_eps:], self.real_A[:, :, :, :move_eps]), 3)
+            self.real_A_right = torch.cat((self.real_A[:, :, :, -move_eps:], self.real_A[:, :, :, :-move_eps]), 3)
+            self.real_A_up = torch.cat((self.real_A[:, :, move_eps:, :], self.real_A[:, :, :move_eps, :]), 2)
+            self.real_A_down = torch.cat((self.real_A[:, :, -move_eps:, :], self.real_A[:, :, :-move_eps, :]), 2)
+
+            self.real_B_left = torch.cat((self.real_B[:, :, :, move_eps:], self.real_B[:, :, :, :move_eps]), 3)
+            self.real_B_right = torch.cat((self.real_B[:, :, :, -move_eps:], self.real_B[:, :, :, :-move_eps]), 3)
+            self.real_B_up = torch.cat((self.real_B[:, :, move_eps:, :], self.real_B[:, :, :move_eps, :]), 2)
+            self.real_B_down = torch.cat((self.real_B[:, :, -move_eps:, :], self.real_B[:, :, :-move_eps, :]), 2)
+
         self.image_paths = input['A_paths' if AtoB else 'B_paths']
 
     def forward(self):
@@ -83,6 +99,29 @@ class CycleGANModel(BaseModel):
 
         self.fake_A = self.netG_B(self.real_B)
         self.rec_B = self.netG_A(self.fake_A)
+
+        if self.isTrain:
+            move_eps = self.opt.video_eps
+
+            self.fake_B_left = self.netG_A(self.real_A_left)
+            self.fake_B_right = self.netG_A(self.real_A_right)
+            self.fake_B_up = self.netG_A(self.real_A_up)
+            self.fake_B_down = self.netG_A(self.real_A_down)
+
+            self.fake_B_from_left = torch.cat((self.fake_B_left[:, :, :, -move_eps:], self.fake_B_left[:, :, :, :-move_eps]), 3)
+            self.fake_B_from_right = torch.cat((self.fake_B_right[:, :, :, move_eps:], self.fake_B_right[:, :, :, :move_eps]), 3)
+            self.fake_B_from_up = torch.cat((self.fake_B_up[:, :, -move_eps:, :], self.fake_B_up[:, :, :-move_eps, :]), 2)
+            self.fake_B_from_down = torch.cat((self.fake_B_down[:, :, move_eps:, :], self.fake_B_down[:, :, :move_eps, :]), 2)
+
+            self.fake_A_left = self.netG_B(self.real_B_left)
+            self.fake_A_right = self.netG_B(self.real_B_right)
+            self.fake_A_up = self.netG_B(self.real_B_up)
+            self.fake_A_down = self.netG_B(self.real_B_down)
+
+            self.fake_A_from_left = torch.cat((self.fake_A_left[:, :, :, -move_eps:], self.fake_A_left[:, :, :, :-move_eps]), 3)
+            self.fake_A_from_right = torch.cat((self.fake_A_right[:, :, :, move_eps:], self.fake_A_right[:, :, :, :move_eps]), 3)
+            self.fake_A_from_up = torch.cat((self.fake_A_up[:, :, -move_eps:, :], self.fake_A_up[:, :, :-move_eps, :]), 2)
+            self.fake_A_from_down = torch.cat((self.fake_A_down[:, :, move_eps:, :], self.fake_A_down[:, :, :move_eps, :]), 2)
 
     def backward_D_basic(self, netD, real, fake):
         # Real
@@ -105,10 +144,11 @@ class CycleGANModel(BaseModel):
         fake_A = self.fake_A_pool.query(self.fake_A)
         self.loss_D_B = self.backward_D_basic(self.netD_B, self.real_A, fake_A)
 
-    def backward_G(self):
+    def backward_G(self, epoch):
         lambda_idt = self.opt.lambda_identity
         lambda_A = self.opt.lambda_A
         lambda_B = self.opt.lambda_B
+        lambda_video = self.opt.lambda_video
         # Identity loss
         if lambda_idt > 0:
             # G_A should be identity if real_B is fed.
@@ -129,17 +169,47 @@ class CycleGANModel(BaseModel):
         self.loss_cycle_A = self.criterionCycle(self.rec_A, self.real_A) * lambda_A
         # Backward cycle loss
         self.loss_cycle_B = self.criterionCycle(self.rec_B, self.real_B) * lambda_B
+
+        if epoch > self.opt.niter + self.opt.niter_decay - self.opt.niter_video:
+            use_video_loss = True
+        else:
+            use_video_loss = False
+
+        if use_video_loss:
+            ###############video loss #############
+            # A loss = Generate from A to B
+            # B loss = Generate from B to A
+
+            loss_video_A_left = self.criterionVideo(self.fake_B, self.fake_B_from_left)
+            loss_video_A_right = self.criterionVideo(self.fake_B, self.fake_B_from_right)
+            loss_video_A_up = self.criterionVideo(self.fake_B, self.fake_B_from_up)
+            loss_video_A_down = self.criterionVideo(self.fake_B, self.fake_B_from_down)
+
+            loss_video_B_left = self.criterionVideo(self.fake_A, self.fake_A_from_left)
+            loss_video_B_right = self.criterionVideo(self.fake_A, self.fake_A_from_right)
+            loss_video_B_up = self.criterionVideo(self.fake_A, self.fake_A_from_up)
+            loss_video_B_down = self.criterionVideo(self.fake_A, self.fake_A_from_down)
+
+            # L1 loss between
+            self.loss_video_A = (loss_video_A_left + loss_video_A_right + loss_video_A_up + loss_video_A_down)/4 * lambda_video
+            # L1 loss between
+            self.loss_video_B = (loss_video_B_left + loss_video_B_right + loss_video_B_up + loss_video_B_down)/4 * lambda_video
+            #######################################
+        else:
+            self.loss_video_A = self.loss_video_B = 0
+
         # combined loss
-        self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B
+        self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B\
+                      + self.loss_idt_A + self.loss_idt_B + self.loss_video_A + self.loss_video_B
         self.loss_G.backward()
 
-    def optimize_parameters(self):
+    def optimize_parameters(self, epoch):
         # forward
         self.forward()
         # G_A and G_B
         self.set_requires_grad([self.netD_A, self.netD_B], False)
         self.optimizer_G.zero_grad()
-        self.backward_G()
+        self.backward_G(epoch)
         self.optimizer_G.step()
         # D_A and D_B
         self.set_requires_grad([self.netD_A, self.netD_B], True)
